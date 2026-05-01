@@ -72,7 +72,7 @@ View the complete circuit design:
 
 | Device | ESP32 Pin |
 | --- | --- |
-| Buzzer Signal | GPIO 25 |
+| Buzzer Signal | GPIO 27 |
 | LED Anode | GPIO 26 (through 220 ohm resistor) |
 | LED Cathode | GND |
 
