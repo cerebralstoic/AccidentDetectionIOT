@@ -1,6 +1,10 @@
 #include <Wire.h>
 #include <LiquidCrystal_I2C.h>
 #include <MPU6050.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <addons/RTDBHelper.h>
+#include "secrets.h"
 
 
 
@@ -14,6 +18,17 @@
 
 //Set 0 for real gps module
 #define USE_REAL_GPS 0
+
+// Cloud 
+const unsigned long LIVE_PUSH_INTERVAL_MS      = 1000;   // live refreshes every 1s
+const unsigned long TELEMETRY_PUSH_INTERVAL_MS = 30000;  // this 30s delay to add history
+unsigned long lastLivePushMs      = 0;
+unsigned long lastTelemetryPushMs = 0;
+
+FirebaseData   fbData;
+FirebaseAuth   fbAuth;
+FirebaseConfig fbConfig;
+bool firebaseReady = false;
 
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
@@ -56,6 +71,164 @@ void getGPSCoordinates(float &lat, float &lon, bool &isReal) {
   lon    = SIMULATED_LON;
   isReal = false;
 #endif
+}
+
+
+//for the cloud setup using firebase
+void setupCloud() {
+  Serial.print("Connecting to Wi-Fi: ");
+  Serial.println(WIFI_SSID);
+  lcd.clear();
+  lcdPrint(0, 0, "WiFi connect..");
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Wi-Fi FAILED. Continuing offline.");
+    lcdPrint(0, 1, "WiFi: OFFLINE  ");
+    delay(1500);
+    firebaseReady = false;
+    return;
+  }
+
+  Serial.print("Wi-Fi OK. IP: ");
+  Serial.println(WiFi.localIP());
+  lcdPrint(0, 1, "WiFi: OK       ");
+  delay(800);
+
+  fbConfig.database_url = FIREBASE_HOST;
+  fbConfig.signer.tokens.legacy_token = FIREBASE_AUTH;
+  Firebase.reconnectWiFi(true);
+  Firebase.begin(&fbConfig, &fbAuth);
+
+  firebaseReady = Firebase.ready();
+  Serial.println(firebaseReady ? "Firebase READY" : "Firebase init pending");
+  lcdPrint(0, 0, "Cloud: ready   ");
+  lcdPrint(0, 1, "               ");
+  delay(800);
+}
+
+
+static void buildSnapshot(FirebaseJson &json,
+                          float ax, float ay, float az,
+                          float gx, float gy, float gz,
+                          float tiltDeg, float netAccel,
+                          bool vibrationConfirmed) {
+  float lat, lon; bool isReal;
+  getGPSCoordinates(lat, lon, isReal);
+
+  json.clear();
+  json.set("deviceId", DEVICE_ID);
+  json.set("ax", ax); json.set("ay", ay); json.set("az", az);
+  json.set("gx", gx); json.set("gy", gy); json.set("gz", gz);
+  json.set("tiltDeg", tiltDeg);
+  json.set("netAccel", netAccel);
+  json.set("vibrationState", vibrationConfirmed ? 1 : 0);
+  json.set("latitude", lat);
+  json.set("longitude", lon);
+  json.set("gpsReal", isReal);
+  json.set("timestamp/.sv", "timestamp"); // server-side timestamp
+}
+
+
+// Live state overwrites nodes every 1 sec
+void pushLive(float ax, float ay, float az,
+              float gx, float gy, float gz,
+              float tiltDeg, float netAccel,
+              bool vibrationConfirmed) {
+  if (!firebaseReady && !(firebaseReady = Firebase.ready())) return;
+
+  FirebaseJson json;
+  buildSnapshot(json, ax, ay, az, gx, gy, gz,
+                tiltDeg, netAccel, vibrationConfirmed);
+  String path = String("/devices/") + DEVICE_ID + "/live";
+  if (!Firebase.RTDB.setJSON(&fbData, path.c_str(), &json)) {
+    Serial.print("pushLive failed: ");
+    Serial.println(fbData.errorReason());
+  }
+}
+
+
+// Telementary history adds every 30 sec
+void pushTelemetry(float ax, float ay, float az,
+                   float gx, float gy, float gz,
+                   float tiltDeg, float netAccel,
+                   bool vibrationConfirmed) {
+  if (!firebaseReady && !(firebaseReady = Firebase.ready())) return;
+
+  FirebaseJson json;
+  buildSnapshot(json, ax, ay, az, gx, gy, gz,
+                tiltDeg, netAccel, vibrationConfirmed);
+  String path = String("/devices/") + DEVICE_ID + "/telemetry";
+  if (!Firebase.RTDB.pushJSON(&fbData, path.c_str(), &json)) {
+    Serial.print("pushTelemetry failed: ");
+    Serial.println(fbData.errorReason());
+  }
+}
+
+
+// Accident event after beign confirmed
+void pushEvent(const String &eventType, const String &severity,
+               float ax, float ay, float az,
+               float gx, float gy, float gz,
+               float tiltDeg, float netAccel,
+               bool vibrationConfirmed) {
+  if (!firebaseReady && !(firebaseReady = Firebase.ready())) {
+    Serial.println("Firebase not ready, event NOT pushed");
+    return;
+  }
+
+  float lat, lon; bool isReal;
+  getGPSCoordinates(lat, lon, isReal);
+
+  FirebaseJson json;
+  json.set("eventType", eventType);
+  json.set("severity", severity);
+  json.set("deviceId", DEVICE_ID);
+  json.set("ax", ax); json.set("ay", ay); json.set("az", az);
+  json.set("gx", gx); json.set("gy", gy); json.set("gz", gz);
+  json.set("tiltDeg", tiltDeg);
+  json.set("netAccel", netAccel);
+  json.set("vibrationState", vibrationConfirmed ? 1 : 0);
+  json.set("latitude", lat);
+  json.set("longitude", lon);
+  json.set("gpsReal", isReal);
+  json.set("timestamp/.sv", "timestamp");
+
+  // For owner of the device
+  String privatePath = String("/devices/") + DEVICE_ID + "/events";
+  if (Firebase.RTDB.pushJSON(&fbData, privatePath.c_str(), &json)) {
+    Serial.print("Event pushed (private): ");
+    Serial.println(fbData.dataPath() + "/" + fbData.pushName());
+  } else {
+    Serial.print("pushEvent (private) failed: ");
+    Serial.println(fbData.errorReason());
+  }
+
+  // For the public users for seeing the events occured
+  FirebaseJson pubJson;
+  pubJson.set("eventType", eventType);
+  pubJson.set("severity",  severity);
+  pubJson.set("deviceId",  DEVICE_ID);
+  pubJson.set("latitude",  lat);
+  pubJson.set("longitude", lon);
+  pubJson.set("tiltDeg",   tiltDeg);
+  pubJson.set("netAccel",  netAccel);
+  pubJson.set("gpsReal",   isReal);
+  pubJson.set("timestamp/.sv", "timestamp");
+
+  if (!Firebase.RTDB.pushJSON(&fbData, "/public/incidents", &pubJson)) {
+    Serial.print("pushEvent (public) failed: ");
+    Serial.println(fbData.errorReason());
+  }
 }
 
 
@@ -165,6 +338,9 @@ void setup() {
 
 
   Serial.println("MPU6050 configured!");
+
+  setupCloud();
+
   Serial.println("System Ready!");
 
 
@@ -300,6 +476,9 @@ void loop() {
 
   if (rollover) {
     triggerGPSAlert("ROLLOVER DETECTED");
+    pushEvent("rollover", "severe",
+              ax, ay, az, gx, gy, gz,
+              tiltDeg, netAccel, vibrationConfirmed);
 
 
     // Frame 1: Banner
@@ -354,6 +533,12 @@ void loop() {
 
   else if (accident) {
     triggerGPSAlert(level + " IMPACT");
+    {
+      String sev = level; sev.toLowerCase();
+      pushEvent("accident", sev,
+                ax, ay, az, gx, gy, gz,
+                tiltDeg, netAccel, vibrationConfirmed);
+    }
 
 
     lcd.clear();
@@ -379,7 +564,7 @@ void loop() {
 
 
   else {
-    
+
     silenceBuzzer();
     if (rolloverHitCount > 0) {
       lcdPrint(0, 0, "ROLL CHECK...");
@@ -390,6 +575,18 @@ void loop() {
       lcdPrint(0, 0, "No Accident");
       lcdPrint(0, 1, "Monitoring...");
     }
+  }
+
+
+  // For continuous on device detection even the device goes offline,
+  unsigned long now = millis();
+  if (now - lastLivePushMs >= LIVE_PUSH_INTERVAL_MS) {
+    lastLivePushMs = now;
+    pushLive(ax, ay, az, gx, gy, gz, tiltDeg, netAccel, vibrationConfirmed);
+  }
+  if (now - lastTelemetryPushMs >= TELEMETRY_PUSH_INTERVAL_MS) {
+    lastTelemetryPushMs = now;
+    pushTelemetry(ax, ay, az, gx, gy, gz, tiltDeg, netAccel, vibrationConfirmed);
   }
 
 
