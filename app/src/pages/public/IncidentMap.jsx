@@ -5,7 +5,6 @@ import {
     useLiveSnapshot, useEvents, isDeviceOnline, DEVICE_ID,
     usePublicIncidents, useViewerLocation, distanceKm,
 } from '../../firebase';
-import AlertSystem from '../../components/AlertSystem';
 
 const PUBLIC_INCIDENT_TTL_MS = 24 * 60 * 60 * 1000; // hide UI markers older than 24h
 const DEFAULT_ALERT_RADIUS_KM = 5;
@@ -61,6 +60,13 @@ function formatTime(ts) {
     return new Date(ts).toLocaleTimeString();
 }
 
+function formatDistance(km) {
+    if (!Number.isFinite(km)) return null;
+    if (km < 1)   return `${Math.round(km * 1000)} m ahead`;
+    if (km < 10)  return `${km.toFixed(1)} km ahead`;
+    return `${Math.round(km)} km away`;
+}
+
 function tiltStatus(tilt) {
     if (tilt === undefined || tilt === null) return { label: 'Unknown', color: 'outline' };
     if (tilt > 75) return { label: 'Critical Tilt',  color: 'primary' };
@@ -75,8 +81,8 @@ export default function IncidentMap() {
     const { coords: viewerCoords, error: locError } = useViewerLocation();
     const online                    = isDeviceOnline(snapshot);
 
-    const lat = snapshot?.latitude  ?? 30.316494;
-    const lon = snapshot?.longitude ?? 78.032191;
+    const lat = snapshot?.latitude  ?? 30.268824;
+    const lon = snapshot?.longitude ?? 77.993090;
     const tilt = snapshot?.tiltDeg ?? 0;
     const tiltState = tiltStatus(tilt);
 
@@ -156,7 +162,7 @@ export default function IncidentMap() {
                                         {inc.netAccel !== undefined && <>Net accel: {inc.netAccel.toFixed(1)} m/s²<br /></>}
                                         {inc.tiltDeg !== undefined && <>Tilt: {inc.tiltDeg.toFixed(0)}°<br /></>}
                                         {viewerCoords && inc.latitude !== undefined && (
-                                            <>Distance: {distanceKm(viewerCoords, { lat: inc.latitude, lon: inc.longitude }).toFixed(1)} km</>
+                                            <>{formatDistance(distanceKm(viewerCoords, { lat: inc.latitude, lon: inc.longitude }))}</>
                                         )}
                                     </Popup>
                                 </Marker>
@@ -246,12 +252,6 @@ export default function IncidentMap() {
                 </div>
             </section>
 
-            <AlertSystem
-                incidents={allPublic}
-                viewerCoords={viewerCoords}
-                radiusKm={radiusKm}
-            />
-
             <aside className="w-full md:w-[420px] bg-surface-container-low border-l border-[#37393B]/20 flex flex-col z-20 shadow-2xl overflow-y-auto">
                 <div className="p-8 space-y-8">
                     <div>
@@ -282,37 +282,52 @@ export default function IncidentMap() {
 
                     <div>
                         <div className="flex justify-between items-center mb-6">
-                            <h3 className="text-sm font-bold tracking-widest text-on-surface-variant uppercase">Critical Feed</h3>
+                            <h3 className="text-sm font-bold tracking-widest text-on-surface-variant uppercase">Public Feed</h3>
                             <span className="material-symbols-outlined text-primary text-sm animate-pulse">radio_button_checked</span>
                         </div>
 
                         <div className="space-y-4">
-                            {events.length === 0 && (
-                                <p className="text-sm text-on-surface-variant">No events recorded.</p>
+                            {visiblePublic.length === 0 && (
+                                <p className="text-sm text-on-surface-variant">No public incidents in last 24h.</p>
                             )}
-                            {events.slice(0, 6).map((e, i) => (
-                                <div key={e.id} className="flex gap-4 group" style={{ opacity: 1 - i * 0.13 }}>
-                                    <div className="flex flex-col items-center">
-                                        <div className={`w-2 h-2 rounded-full ${i === 0 ? 'bg-primary ring-4 ring-primary/20' : 'bg-outline-variant'}`}></div>
-                                        {i < events.length - 1 && (
-                                            <div className={`w-px flex-1 ${i === 0 ? 'bg-gradient-to-b from-primary to-transparent' : 'bg-outline-variant/30'} mt-2`}></div>
-                                        )}
+                            {visiblePublic.slice(0, 8).map((inc, i) => {
+                                const dist = (viewerCoords && inc.latitude !== undefined && inc.longitude !== undefined)
+                                    ? distanceKm(viewerCoords, { lat: inc.latitude, lon: inc.longitude })
+                                    : null;
+                                const distText = dist !== null ? formatDistance(dist) : null;
+                                const isNear = dist !== null && dist <= radiusKm;
+
+                                return (
+                                    <div key={inc.id} className="flex gap-4 group" style={{ opacity: 1 - i * 0.10 }}>
+                                        <div className="flex flex-col items-center">
+                                            <div className={`w-2 h-2 rounded-full ${isNear ? 'bg-error ring-4 ring-error/30' : i === 0 ? 'bg-primary ring-4 ring-primary/20' : 'bg-outline-variant'}`}></div>
+                                            {i < visiblePublic.length - 1 && (
+                                                <div className={`w-px flex-1 ${i === 0 ? 'bg-gradient-to-b from-primary to-transparent' : 'bg-outline-variant/30'} mt-2`}></div>
+                                            )}
+                                        </div>
+                                        <div className="pb-6 flex-1">
+                                            <div className="flex justify-between items-baseline gap-2">
+                                                <p className={`text-[10px] font-bold tabular-nums ${i === 0 ? 'text-primary' : 'text-on-surface-variant'}`}>
+                                                    {formatTime(inc.timestamp)}
+                                                </p>
+                                                {distText && (
+                                                    <span className={`text-[10px] font-bold tabular-nums ${isNear ? 'text-error' : 'text-on-surface-variant'}`}>
+                                                        {distText}
+                                                    </span>
+                                                )}
+                                            </div>
+                                            <h4 className="text-sm font-bold text-on-surface mt-1">
+                                                {inc.eventType === 'rollover' ? 'Rollover' : 'Impact'} &bull; {inc.severity?.toUpperCase()}
+                                            </h4>
+                                            <p className="text-xs text-on-surface-variant leading-relaxed">
+                                                {inc.deviceId}
+                                                {inc.eventType === 'rollover' && inc.tiltDeg !== undefined && ` · Tilt ${inc.tiltDeg.toFixed(0)}°`}
+                                                {inc.eventType !== 'rollover' && inc.netAccel !== undefined && ` · Net ${inc.netAccel.toFixed(1)} m/s²`}
+                                            </p>
+                                        </div>
                                     </div>
-                                    <div className="pb-6">
-                                        <p className={`text-[10px] font-bold tabular-nums ${i === 0 ? 'text-primary' : 'text-on-surface-variant'} mb-1`}>
-                                            {formatTime(e.timestamp)}
-                                        </p>
-                                        <h4 className="text-sm font-bold text-on-surface">
-                                            {e.eventType === 'rollover' ? 'Rollover Detected' : 'Impact Detected'} &bull; {e.severity?.toUpperCase()}
-                                        </h4>
-                                        <p className="text-xs text-on-surface-variant leading-relaxed">
-                                            {e.eventType === 'rollover'
-                                                ? `Tilt ${e.tiltDeg?.toFixed(0)}°, gyro spike confirmed.`
-                                                : `Net accel ${e.netAccel?.toFixed(1)} m/s², vibration ${e.vibrationState ? 'YES' : 'NO'}.`}
-                                        </p>
-                                    </div>
-                                </div>
-                            ))}
+                                );
+                            })}
                         </div>
                     </div>
 
