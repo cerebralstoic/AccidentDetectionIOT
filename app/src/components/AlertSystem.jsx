@@ -7,6 +7,10 @@ const SEVERITY_FREQ = {
     minor:    440,
 };
 
+const BUZZER_REPEAT_MS  = 2000;   // play beep every 2 seconds
+const BUZZER_MAX_MS     = 30000;  // stop automatically after 30 seconds
+const TOAST_TTL_MS      = 30000;  // toast visible while buzzer can fire
+
 function playBeep(audioCtx, freq = 660) {
     const now = audioCtx.currentTime;
     [0, 0.25, 0.5].forEach((offset) => {
@@ -36,31 +40,64 @@ function formatDistance(km) {
 }
 
 export default function AlertSystem({ incidents, viewerCoords, radiusKm = 5 }) {
-    const [audioReady,  setAudioReady] = useState(false);
-    const [toasts,      setToasts]     = useState([]);
+    const [audioReady,  setAudioReady]  = useState(false);
+    const [toasts,      setToasts]      = useState([]);
+    const [activeIds,   setActiveIds]   = useState(new Set());
     const audioCtxRef   = useRef(null);
     const lastSeenTsRef = useRef(null);
+    const buzzersRef    = useRef(new Map()); // id -> { intervalId, stopAt }
+
+    const stopBuzzer = (id) => {
+        const b = buzzersRef.current.get(id);
+        if (b) {
+            clearInterval(b.intervalId);
+            buzzersRef.current.delete(id);
+        }
+        setActiveIds((prev) => {
+            if (!prev.has(id)) return prev;
+            const next = new Set(prev);
+            next.delete(id);
+            return next;
+        });
+    };
+
+    const stopAllBuzzers = () => {
+        for (const [id, b] of buzzersRef.current.entries()) {
+            clearInterval(b.intervalId);
+            buzzersRef.current.delete(id);
+        }
+        setActiveIds(new Set());
+    };
+
+    const startBuzzer = (id, freq) => {
+        if (buzzersRef.current.has(id)) return;
+        if (!audioCtxRef.current) return;
+
+        try { playBeep(audioCtxRef.current, freq); } catch { /* ignore */ }
+
+        const stopAt = Date.now() + BUZZER_MAX_MS;
+        const intervalId = setInterval(() => {
+            if (Date.now() >= stopAt) {
+                stopBuzzer(id);
+                return;
+            }
+            try { playBeep(audioCtxRef.current, freq); } catch { /* ignore */ }
+        }, BUZZER_REPEAT_MS);
+
+        buzzersRef.current.set(id, { intervalId, stopAt });
+        setActiveIds((prev) => new Set(prev).add(id));
+    };
 
     useEffect(() => {
         if (lastSeenTsRef.current !== null) return;
         lastSeenTsRef.current = incidents.length > 0
             ? (incidents[0].timestamp || 0)
             : 0;
-        console.log('[AlertSystem] baseline ts set to', lastSeenTsRef.current,
-                    `(${incidents.length} existing incidents)`);
     }, [incidents]);
 
     useEffect(() => {
         if (lastSeenTsRef.current === null) return;
         const fresh = incidents.filter(i => (i.timestamp || 0) > lastSeenTsRef.current);
-        console.log('[AlertSystem] check', {
-            total: incidents.length,
-            fresh: fresh.length,
-            lastSeen: lastSeenTsRef.current,
-            audioReady,
-            radiusKm,
-            viewerCoords,
-        });
         if (fresh.length === 0) return;
 
         lastSeenTsRef.current = fresh[0].timestamp || lastSeenTsRef.current;
@@ -71,31 +108,20 @@ export default function AlertSystem({ incidents, viewerCoords, radiusKm = 5 }) {
                 : Infinity;
             const inRadius = dist <= radiusKm;
 
-            console.log('[AlertSystem] new incident', {
-                id: inc.id,
-                eventType: inc.eventType,
-                severity: inc.severity,
-                lat: inc.latitude, lon: inc.longitude,
-                ts: inc.timestamp,
-                distKm: dist,
-                inRadius,
-                willBeep: inRadius && audioReady,
-            });
-
             setToasts((prev) => [
                 {
                     id: inc.id,
                     inc,
                     distKm: dist,
                     inRadius,
-                    expiresAt: Date.now() + 8000,
+                    expiresAt: Date.now() + TOAST_TTL_MS,
                 },
                 ...prev.slice(0, 4),
             ]);
 
             if (inRadius && audioReady && audioCtxRef.current) {
                 const freq = SEVERITY_FREQ[inc.severity] || SEVERITY_FREQ.moderate;
-                try { playBeep(audioCtxRef.current, freq); } catch (e) { console.error('beep failed', e); }
+                startBuzzer(inc.id, freq);
             }
         });
     }, [incidents, viewerCoords, radiusKm, audioReady]);
@@ -106,6 +132,13 @@ export default function AlertSystem({ incidents, viewerCoords, radiusKm = 5 }) {
             setToasts((prev) => prev.filter(x => x.expiresAt > now));
         }, 1000);
         return () => clearInterval(t);
+    }, []);
+
+    useEffect(() => {
+        return () => {
+            for (const b of buzzersRef.current.values()) clearInterval(b.intervalId);
+            buzzersRef.current.clear();
+        };
     }, []);
 
     const enableAudio = () => {
@@ -129,7 +162,12 @@ export default function AlertSystem({ incidents, viewerCoords, radiusKm = 5 }) {
         try { playBeep(audioCtxRef.current, SEVERITY_FREQ.moderate); } catch { /* ignore */ }
     };
 
-    const dismissToast = (id) => setToasts((prev) => prev.filter(t => t.id !== id));
+    const dismissToast = (id) => {
+        stopBuzzer(id);
+        setToasts((prev) => prev.filter(t => t.id !== id));
+    };
+
+    const anyActive = activeIds.size > 0;
 
     return (
         <>
@@ -140,6 +178,14 @@ export default function AlertSystem({ incidents, viewerCoords, radiusKm = 5 }) {
                 >
                     <span className="material-symbols-outlined text-base">volume_up</span>
                     Enable sound
+                </button>
+            ) : anyActive ? (
+                <button
+                    onClick={stopAllBuzzers}
+                    className="fixed top-20 right-4 z-[1000] px-4 py-2 bg-error text-on-error text-xs font-bold rounded-full shadow-lg flex items-center gap-2 hover:scale-105 transition-transform animate-pulse"
+                >
+                    <span className="material-symbols-outlined text-base">notifications_off</span>
+                    Stop alert
                 </button>
             ) : (
                 <button
@@ -155,6 +201,7 @@ export default function AlertSystem({ incidents, viewerCoords, radiusKm = 5 }) {
                 {toasts.map((t) => {
                     const sev = t.inc.severity || 'minor';
                     const ringColor = sev === 'severe' ? 'border-error' : sev === 'moderate' ? 'border-tertiary' : 'border-secondary';
+                    const isBuzzing = activeIds.has(t.id);
                     return (
                         <div
                             key={t.id}
@@ -185,6 +232,15 @@ export default function AlertSystem({ incidents, viewerCoords, radiusKm = 5 }) {
                                         <p className={`text-[11px] font-bold mt-1 ${t.inRadius ? 'text-error' : 'text-on-surface-variant'}`}>
                                             {t.inRadius ? '⚠ ' : ''}{formatDistance(t.distKm)}
                                         </p>
+                                    )}
+                                    {isBuzzing && (
+                                        <button
+                                            onClick={() => stopBuzzer(t.id)}
+                                            className="mt-2 px-3 py-1 bg-error text-on-error text-[10px] font-bold uppercase tracking-wider rounded-full hover:opacity-90 flex items-center gap-1"
+                                        >
+                                            <span className="material-symbols-outlined text-sm">notifications_off</span>
+                                            Silence
+                                        </button>
                                     )}
                                 </div>
                             </div>
