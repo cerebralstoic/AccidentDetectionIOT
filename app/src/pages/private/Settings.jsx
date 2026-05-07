@@ -239,7 +239,7 @@ export default function Settings() {
                 </div>
 
                 <p className="text-[11px] text-on-surface-variant italic">
-                    Note: changes are saved to <code>/devices/{DEVICE_ID}/config/thresholds</code>. The ESP32 firmware does not yet read this node — values are advisory until the next firmware update adds a config listener.
+                    Saved to <code>/devices/{DEVICE_ID}/config/thresholds</code>. The ESP32 subscribes to this node and applies new values within ~1 second of clicking save — no reflash needed.
                 </p>
             </section>
 
