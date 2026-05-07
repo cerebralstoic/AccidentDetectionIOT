@@ -2,13 +2,11 @@ import { useEffect, useRef, useState } from 'react';
 import { distanceKm } from '../firebase';
 
 const SEVERITY_FREQ = {
-    severe:   880, // A5
-    moderate: 660, // E5
-    minor:    440, // A4
+    severe:   880,
+    moderate: 660,
+    minor:    440,
 };
 
-// Plays a 3-pulse beep at the given frequency through the Web Audio API.
-// No external assets needed.
 function playBeep(audioCtx, freq = 660) {
     const now = audioCtx.currentTime;
     [0, 0.25, 0.5].forEach((offset) => {
@@ -30,29 +28,39 @@ function formatTime(ts) {
     return new Date(ts).toLocaleTimeString();
 }
 
-// Renders a fixed-position toast stack and triggers buzzer on near-by incidents.
-// `incidents`     — array sorted newest-first
-// `viewerCoords`  — { lat, lon } or null (null = never beep)
-// `radiusKm`      — beep only if incident is within this many km of viewer
-export default function AlertSystem({ incidents, viewerCoords, radiusKm = 5 }) {
-    const [audioReady,     setAudioReady]     = useState(false);
-    const [toasts,         setToasts]         = useState([]);
-    const audioCtxRef      = useRef(null);
-    const lastSeenTsRef    = useRef(null); // newest event ts we've already shown
+function formatDistance(km) {
+    if (!Number.isFinite(km)) return null;
+    if (km < 1)  return `${Math.round(km * 1000)} m ahead`;
+    if (km < 10) return `${km.toFixed(1)} km ahead`;
+    return `${Math.round(km)} km away`;
+}
 
-    // First load: capture the newest existing timestamp so we don't re-toast history.
+export default function AlertSystem({ incidents, viewerCoords, radiusKm = 5 }) {
+    const [audioReady,  setAudioReady] = useState(false);
+    const [toasts,      setToasts]     = useState([]);
+    const audioCtxRef   = useRef(null);
+    const lastSeenTsRef = useRef(null);
+
     useEffect(() => {
-        if (lastSeenTsRef.current === null && incidents.length > 0) {
-            lastSeenTsRef.current = incidents[0].timestamp || 0;
-        } else if (lastSeenTsRef.current === null) {
-            lastSeenTsRef.current = 0;
-        }
+        if (lastSeenTsRef.current !== null) return;
+        lastSeenTsRef.current = incidents.length > 0
+            ? (incidents[0].timestamp || 0)
+            : 0;
+        console.log('[AlertSystem] baseline ts set to', lastSeenTsRef.current,
+                    `(${incidents.length} existing incidents)`);
     }, [incidents]);
 
-    // Watch for newer-than-seen incidents.
     useEffect(() => {
         if (lastSeenTsRef.current === null) return;
         const fresh = incidents.filter(i => (i.timestamp || 0) > lastSeenTsRef.current);
+        console.log('[AlertSystem] check', {
+            total: incidents.length,
+            fresh: fresh.length,
+            lastSeen: lastSeenTsRef.current,
+            audioReady,
+            radiusKm,
+            viewerCoords,
+        });
         if (fresh.length === 0) return;
 
         lastSeenTsRef.current = fresh[0].timestamp || lastSeenTsRef.current;
@@ -63,7 +71,17 @@ export default function AlertSystem({ incidents, viewerCoords, radiusKm = 5 }) {
                 : Infinity;
             const inRadius = dist <= radiusKm;
 
-            // Always toast.
+            console.log('[AlertSystem] new incident', {
+                id: inc.id,
+                eventType: inc.eventType,
+                severity: inc.severity,
+                lat: inc.latitude, lon: inc.longitude,
+                ts: inc.timestamp,
+                distKm: dist,
+                inRadius,
+                willBeep: inRadius && audioReady,
+            });
+
             setToasts((prev) => [
                 {
                     id: inc.id,
@@ -75,15 +93,13 @@ export default function AlertSystem({ incidents, viewerCoords, radiusKm = 5 }) {
                 ...prev.slice(0, 4),
             ]);
 
-            // Beep only if in radius and audio is unlocked.
             if (inRadius && audioReady && audioCtxRef.current) {
                 const freq = SEVERITY_FREQ[inc.severity] || SEVERITY_FREQ.moderate;
-                try { playBeep(audioCtxRef.current, freq); } catch { /* ignore */ }
+                try { playBeep(audioCtxRef.current, freq); } catch (e) { console.error('beep failed', e); }
             }
         });
     }, [incidents, viewerCoords, radiusKm, audioReady]);
 
-    // Garbage-collect expired toasts.
     useEffect(() => {
         const t = setInterval(() => {
             const now = Date.now();
@@ -96,7 +112,6 @@ export default function AlertSystem({ incidents, viewerCoords, radiusKm = 5 }) {
         try {
             const Ctx = window.AudioContext || window.webkitAudioContext;
             const ctx = new Ctx();
-            // Play a tiny silent blip to fully unlock on iOS.
             const osc = ctx.createOscillator();
             const gain = ctx.createGain();
             gain.gain.value = 0.0001;
@@ -109,17 +124,30 @@ export default function AlertSystem({ incidents, viewerCoords, radiusKm = 5 }) {
         }
     };
 
+    const testBeep = () => {
+        if (!audioCtxRef.current) return;
+        try { playBeep(audioCtxRef.current, SEVERITY_FREQ.moderate); } catch { /* ignore */ }
+    };
+
     const dismissToast = (id) => setToasts((prev) => prev.filter(t => t.id !== id));
 
     return (
         <>
-            {!audioReady && (
+            {!audioReady ? (
                 <button
                     onClick={enableAudio}
-                    className="fixed top-20 left-1/2 -translate-x-1/2 z-[1000] px-4 py-2 bg-tertiary text-on-tertiary text-xs font-bold rounded-full shadow-lg flex items-center gap-2 hover:scale-105 transition-transform"
+                    className="fixed top-20 right-4 z-[1000] px-3 py-2 bg-tertiary text-on-tertiary text-xs font-bold rounded-full shadow-lg flex items-center gap-2 hover:scale-105 transition-transform"
                 >
                     <span className="material-symbols-outlined text-base">volume_up</span>
-                    Enable sound alerts
+                    Enable sound
+                </button>
+            ) : (
+                <button
+                    onClick={testBeep}
+                    title="Test buzzer"
+                    className="fixed top-20 right-4 z-[1000] w-10 h-10 bg-surface-container-high text-on-surface rounded-full shadow-lg flex items-center justify-center hover:scale-105 transition-transform"
+                >
+                    <span className="material-symbols-outlined text-base">volume_up</span>
                 </button>
             )}
 
@@ -130,7 +158,7 @@ export default function AlertSystem({ incidents, viewerCoords, radiusKm = 5 }) {
                     return (
                         <div
                             key={t.id}
-                            className={`pointer-events-auto bg-surface-container-high rounded-xl p-4 border-l-4 ${ringColor} shadow-2xl backdrop-blur-md animate-[slideIn_0.3s_ease-out]`}
+                            className={`pointer-events-auto bg-surface-container-high rounded-xl p-4 border-l-4 ${ringColor} shadow-2xl backdrop-blur-md`}
                             style={{ animation: 'slideIn 0.3s ease-out' }}
                         >
                             <div className="flex items-start gap-3">
@@ -147,7 +175,7 @@ export default function AlertSystem({ incidents, viewerCoords, radiusKm = 5 }) {
                                             className="text-on-surface-variant hover:text-on-surface text-xs"
                                             aria-label="Dismiss"
                                         >
-                                            âœ•
+                                            ✕
                                         </button>
                                     </div>
                                     <p className="text-xs text-on-surface-variant mt-1">
@@ -155,9 +183,7 @@ export default function AlertSystem({ incidents, viewerCoords, radiusKm = 5 }) {
                                     </p>
                                     {Number.isFinite(t.distKm) && (
                                         <p className={`text-[11px] font-bold mt-1 ${t.inRadius ? 'text-error' : 'text-on-surface-variant'}`}>
-                                            {t.inRadius
-                                                ? `âš  ${t.distKm.toFixed(1)} km from you`
-                                                : `${t.distKm.toFixed(0)} km away`}
+                                            {t.inRadius ? '⚠ ' : ''}{formatDistance(t.distKm)}
                                         </p>
                                     )}
                                 </div>
