@@ -26,6 +26,7 @@ unsigned long lastLivePushMs      = 0;
 unsigned long lastTelemetryPushMs = 0;
 
 FirebaseData   fbData;
+FirebaseData   fbConfigStream;
 FirebaseAuth   fbAuth;
 FirebaseConfig fbConfig;
 bool firebaseReady = false;
@@ -39,12 +40,18 @@ bool accident = false;
 bool rollover = false;
 
 
-//Roll over threshold
-const float ROLLOVER_TILT_DEG       = 75.0;
-const float ROLLOVER_GYRO_DEG_S     = 200.0;
+// Runtime thresholds. Defaults match what was const before; the dashboard
+// can overwrite these by writing to /devices/<id>/config/thresholds.
+float ROLLOVER_TILT_DEG       = 75.0;
+float ROLLOVER_GYRO_DEG_S     = 200.0;
 const float ROLLOVER_PRE_TILT_DEG   = 45.0;
 const float ROLLOVER_PRE_GYRO_DEG_S = 70.0;
 const int   ROLLOVER_CONFIRM_COUNT  = 3;
+
+// Net-acceleration thresholds in m/s² (gravity removed).
+float ACCEL_MINOR    = 7.0;
+float ACCEL_MODERATE = 12.0;
+float ACCEL_SEVERE   = 20.0;
 
 
 int rolloverHitCount = 0;
@@ -55,8 +62,8 @@ const unsigned long VIB_WINDOW_MS = 500;
 
 
 // fake mock gps 
-const float SIMULATED_LAT = 30.316494;
-const float SIMULATED_LON = 78.032191;
+const float SIMULATED_LAT = 30.268824;
+const float SIMULATED_LON = 77.993090;
 
 
 // for real gps
@@ -114,6 +121,76 @@ void setupCloud() {
   lcdPrint(0, 0, "Cloud: ready   ");
   lcdPrint(0, 1, "               ");
   delay(800);
+}
+
+
+//To pull the threshold values from the firebase and update at realtime
+void applyThresholdsFromJson(FirebaseJson &json) {
+  FirebaseJsonData v;
+
+  if (json.get(v, "accelMinor")    && v.success) ACCEL_MINOR        = v.to<float>();
+  if (json.get(v, "accelModerate") && v.success) ACCEL_MODERATE     = v.to<float>();
+  if (json.get(v, "accelSevere")   && v.success) ACCEL_SEVERE       = v.to<float>();
+  if (json.get(v, "rolloverTilt")  && v.success) ROLLOVER_TILT_DEG  = v.to<float>();
+  if (json.get(v, "rolloverGyro")  && v.success) ROLLOVER_GYRO_DEG_S = v.to<float>();
+
+  Serial.println("Thresholds updated from cloud:");
+  Serial.print("  accel minor/moderate/severe: ");
+  Serial.print(ACCEL_MINOR);    Serial.print(" / ");
+  Serial.print(ACCEL_MODERATE); Serial.print(" / ");
+  Serial.println(ACCEL_SEVERE);
+  Serial.print("  rollover tilt / gyro: ");
+  Serial.print(ROLLOVER_TILT_DEG); Serial.print("° / ");
+  Serial.print(ROLLOVER_GYRO_DEG_S); Serial.println(" deg/s");
+}
+
+
+void fetchInitialThresholds() {
+  if (!firebaseReady && !(firebaseReady = Firebase.ready())) return;
+
+  String path = String("/devices/") + DEVICE_ID + "/config/thresholds";
+  if (Firebase.RTDB.getJSON(&fbData, path.c_str())) {
+    FirebaseJson *json = fbData.jsonObjectPtr();
+    if (json) applyThresholdsFromJson(*json);
+  } else {
+    Serial.print("No initial thresholds (using defaults): ");
+    Serial.println(fbData.errorReason());
+  }
+}
+
+
+
+void thresholdStreamCallback(FirebaseStream data) {
+  Serial.print("Threshold stream event: ");
+  Serial.println(data.dataPath());
+
+  String path = String("/devices/") + DEVICE_ID + "/config/thresholds";
+  if (Firebase.RTDB.getJSON(&fbData, path.c_str())) {
+    FirebaseJson *json = fbData.jsonObjectPtr();
+    if (json) applyThresholdsFromJson(*json);
+  }
+}
+
+void thresholdStreamTimeout(bool timeout) {
+  if (timeout) Serial.println("Threshold stream timeout, resuming...");
+  if (!fbConfigStream.httpConnected()) {
+    Serial.print("Threshold stream not connected: ");
+    Serial.println(fbConfigStream.errorReason());
+  }
+}
+
+
+void startThresholdStream() {
+  String path = String("/devices/") + DEVICE_ID + "/config/thresholds";
+  if (!Firebase.RTDB.beginStream(&fbConfigStream, path.c_str())) {
+    Serial.print("Stream begin failed: ");
+    Serial.println(fbConfigStream.errorReason());
+    return;
+  }
+  Firebase.RTDB.setStreamCallback(&fbConfigStream,
+                                  thresholdStreamCallback,
+                                  thresholdStreamTimeout);
+  Serial.println("Threshold stream subscribed.");
 }
 
 
@@ -340,6 +417,8 @@ void setup() {
   Serial.println("MPU6050 configured!");
 
   setupCloud();
+  fetchInitialThresholds();
+  startThresholdStream();
 
   Serial.println("System Ready!");
 
@@ -435,13 +514,13 @@ void loop() {
   String level = "NORMAL";
   bool impactSpike = false;
 
-  if (netAccel > 20.0) {
+  if (netAccel > ACCEL_SEVERE) {
     level = "SEVERE";
     impactSpike = true;
-  } else if (netAccel > 12.0) {
+  } else if (netAccel > ACCEL_MODERATE) {
     level = "MODERATE";
     impactSpike = true;
-  } else if (netAccel > 7.0) {
+  } else if (netAccel > ACCEL_MINOR) {
     level = "MINOR";
     impactSpike = true;
   }
